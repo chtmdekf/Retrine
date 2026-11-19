@@ -1,0 +1,168 @@
+workflows:
+  spotify-ipa-build:
+    name: Build IPA from your own Spotify IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    environment:
+      xcode: latest
+      vars:
+        WIREGUARD: "1"
+        NO_PLUGINS: "0"
+        UPLOAD_METHOD: "artifacts"
+        BUNDLE_ID: ""
+
+    cache:
+      cache_paths:
+        - ~/.ccache
+        - out/extension
+
+    scripts:
+      - name: Setup Theos and dependencies
+        script: |
+          set -e
+
+          brew install aria2 ccache
+
+          export THEOS="$CM_BUILD_DIR/theos"
+          echo "THEOS=$THEOS" >> "$CM_ENV"
+
+          if [ ! -d "$THEOS" ]; then
+            git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          fi
+
+          export MD_APPLE_SDK_ROOT="$(xcode-select -p | sed 's|/Contents/Developer$||')"
+          echo "MD_APPLE_SDK_ROOT=$MD_APPLE_SDK_ROOT" >> "$CM_ENV"
+
+      - name: Setup Go
+        script: |
+          set -e
+
+          if [ "$WIREGUARD" = "1" ]; then
+            brew install go
+
+            EXPECTED="$(awk '$1 == "go" {print $2}' WireGuard/go.mod)"
+            ACTUAL="$(go env GOVERSION)"
+
+            test "$ACTUAL" = "go$EXPECTED"
+          fi
+
+      - name: Install cyan
+        script: |
+          python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+
+      - name: Download IPA
+        script: |
+          set -e
+
+          test -n "$IPA_URL" || {
+            echo "IPA_URL is not configured"
+            exit 1
+          }
+
+          mkdir -p ipa
+
+          IPA_URL="$(python3 -B - <<'PY'
+          import os
+          from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+          url = os.environ["IPA_URL"].strip().replace(r"\&", "&")
+          parts = urlsplit(url)
+
+          if parts.scheme == "https" and parts.hostname in {
+              "dropbox.com",
+              "www.dropbox.com",
+              "dl.dropboxusercontent.com"
+          }:
+              query = [
+                  (k, v)
+                  for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                  if k != "dl"
+              ]
+              query.append(("dl", "1"))
+              url = urlunsplit(parts._replace(
+                  netloc="dl.dropboxusercontent.com",
+                  query=urlencode(query)
+              ))
+
+          print(url)
+          PY
+          )"
+
+          aria2c \
+            --console-log-level=error \
+            --summary-interval=0 \
+            --download-result=hide \
+            --max-connection-per-server=8 \
+            --split=8 \
+            --min-split-size=1M \
+            --max-tries=20 \
+            --retry-wait=3 \
+            --continue=true \
+            --allow-overwrite=true \
+            --dir=ipa \
+            --out=spotify.ipa \
+            "$IPA_URL" || {
+              rm -f ipa/spotify.ipa ipa/spotify.ipa.aria2
+              curl -fsSL --retry 10 --retry-all-errors \
+                --retry-delay 3 -C - -o ipa/spotify.ipa "$IPA_URL"
+            }
+
+      - name: Validate Spotify IPA
+        script: |
+          set -e
+          python3 -B scripts/validate-ipa.py ipa/spotify.ipa
+
+      - name: Build IPA
+        script: |
+          set -o pipefail
+
+          export THEOS="$CM_BUILD_DIR/theos"
+          export MAKEFLAGS="-k"
+
+          make release IPA=ipa/spotify.ipa \
+            NO_PLUGINS="$NO_PLUGINS" \
+            2>&1 | tee "$CM_BUILD_DIR/ipa-build.log"
+
+      - name: Verify extensions removed
+        script: |
+          if [ "$NO_PLUGINS" = "1" ]; then
+            python3 -B - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          for ipa in Path("out").glob("*.ipa"):
+              with zipfile.ZipFile(ipa) as archive:
+                  if any(
+                      part == "PlugIns" or part.endswith(".appex")
+                      for name in archive.namelist()
+                      for part in name.split("/")
+                  ):
+                      raise SystemExit(f"{ipa} still contains extensions")
+
+              print(f"{ipa}: no extensions")
+          PY
+          fi
+
+      - name: Upload to filebin
+        script: |
+          if [ "$UPLOAD_METHOD" != "artifacts" ]; then
+            BIN="retrine-${CM_BUILD_ID}"
+
+            for f in out/*.ipa; do
+              curl -fsS -X POST \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary "@$f" \
+                "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
+
+              echo "Uploaded: https://filebin.net/$BIN/$(basename "$f")"
+            done
+          fi
+
+      - name: Show ccache stats
+        script: |
+          ccache --show-stats || true
+
+    artifacts:
+      - out/*.ipa
+      - ipa-build.log
