@@ -10,7 +10,6 @@ workflows:
         WIREGUARD: "1"
         NO_PLUGINS: "0"
         UPLOAD_METHOD: "artifacts"
-        BUNDLE_ID: ""
 
     cache:
       cache_paths:
