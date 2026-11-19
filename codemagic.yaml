@@ -6,10 +6,8 @@ workflows:
 
     environment:
       xcode: latest
-      vars:
-        WIREGUARD: "1"
-        NO_PLUGINS: "0"
-        UPLOAD_METHOD: "artifacts"
+      groups:
+        - vitrine-build
 
     cache:
       cache_paths:
